@@ -130,6 +130,83 @@ system_stability <- function(coupling = 0.55, recovery = 0.30) {
 }
 
 # -----------------------------
+# Work & Study timeline (About page)
+# -----------------------------
+
+work_study_timeline <- list(
+  list(side = "left",  year = "2016–2018",
+       title = "Bachelor of Psychology (started)",
+       description = "PUCRS, Brazil."),
+  list(side = "right", year = "2017–2019",
+       title = "Undergraduate Research Fellow",
+       description = "PUCRS Health and Life Sciences Department, Brazil. Supported day-to-day research operations, including data collection, data processing and writing manuscripts. Funded by Brazil's national research council (CNPq)."),
+  list(side = "left",  year = "2018–2021",
+       title = "BSc in Psychology",
+       description = "VU Amsterdam. Cum Laude & Honours degree. GPA: 8.9."),
+  list(side = "right", year = "2021",
+       title = "Bachelor Student Award",
+       description = "Faculty of Behavioural and Movement Sciences, VU Amsterdam."),
+  list(side = "left",  year = "2021–2022",
+       title = "MSc in Clinical Psychology",
+       description = "Utrecht University. Cum Laude degree. GPA: 8.6."),
+  list(side = "right", year = "2021",
+       title = "Bright Minds Fellowship",
+       description = "Utrecht University."),
+  list(side = "right", year = "2021",
+       title = "Research Internship",
+       description = "Utrecht University. Co-designed and conducted a pilot experimental lab study in interoceptive body awareness, emotions and mental health problems. Supervisor: Prof Dr. Lotte Gerritsen. Final Grade: 8.5."),
+  list(side = "right", year = "2021",
+       title = "Master's Thesis: Network Analysis of Depression, Anxiety and Family Functioning",
+       description = "Research project examining network relations between family factors and individual symptoms of depression and anxiety. Supervisor: Prof Dr Lynn Boschloo. Final Grade: 9.0."),
+  list(side = "right", year = "2022–2025",
+       title = "Junior Lecturer — Psychology",
+       description = "VU Amsterdam. Taught seminars for B1 and B2 level courses in the Psychology Bachelor international program, including Research Methods 1, Statistics 1, Measurement Theory and Assessment 1 & 2, Personality Theory and Assessment.<br/><br/>· Head teacher for the courses Big Data in Psychology and Developmental Psychopathology, overseeing tutorial organisation."),
+  list(side = "right", year = "2025–2026",
+       title = "Statistics Consultant",
+       description = "Independent statistical consultant advising researchers and students in Psychology/Psychiatry with data analyses and interpretation, primarily in R and SPSS, including network models and general linear models."),
+  list(side = "left",  year = "2025",
+       title = "University Teacher Qualification (UTQ/BKO)",
+       description = ""),
+  list(side = "left",  year = "2026",
+       title = "Clinical Internship",
+       description = "Overcome, UK. Supervised practice delivering one-to-one psychological coaching sessions to international clients for low-intensity mental health problems, with evidence-based techniques (CBT & ACT).")
+)
+
+# Renders one row of the timeline: a box on the given side, an empty cell on
+# the other side, and a dot + year marker on the shared centre line.
+timeline_row <- function(item) {
+  box <- div(
+    class = paste("timeline-box", item$side),
+    div(class = "timeline-box-title", item$title),
+    if (nzchar(item$description)) div(class = "timeline-box-desc", HTML(item$description))
+  )
+
+  div(class = "timeline-row",
+      div(class = "timeline-cell timeline-cell-left",
+          if (item$side == "left") box),
+      div(class = "timeline-cell timeline-cell-center",
+          div(class = "timeline-dot"),
+          div(class = "timeline-year", item$year)
+      ),
+      div(class = "timeline-cell timeline-cell-right",
+          if (item$side == "right") box)
+  )
+}
+
+# Renders the full timeline: column headers + a central line + one row per
+# item, in the order the items are supplied.
+render_timeline <- function(items) {
+  div(class = "timeline-container",
+      div(class = "timeline-columns-header",
+          div(class = "timeline-header-left", "EDUCATION & TRAINING"),
+          div(class = "timeline-header-center"),
+          div(class = "timeline-header-right", "WORK & ACHIEVEMENTS")
+      ),
+      lapply(items, timeline_row)
+  )
+}
+
+# -----------------------------
 # UI
 # -----------------------------
 
@@ -336,6 +413,104 @@ ui <- fluidPage(
         overflow-y: auto;
       }
 
+      /* ---- Work & Study timeline ---- */
+      .timeline-container {
+        position: relative;
+        padding: 4px 0 8px;
+      }
+
+      .timeline-columns-header {
+        display: grid;
+        grid-template-columns: 1fr 70px 1fr;
+        column-gap: 18px;
+        margin-bottom: 10px;
+      }
+
+      .timeline-header-left,
+      .timeline-header-right {
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+        color: var(--muted);
+        text-align: center;
+      }
+
+      .timeline-row {
+        display: grid;
+        grid-template-columns: 1fr 70px 1fr;
+        column-gap: 18px;
+        position: relative;
+      }
+
+      .timeline-cell-center {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+
+      /* Central vertical line, spanning the whole container behind the rows */
+      .timeline-container::before {
+        content: '';
+        position: absolute;
+        left: 50%;
+        top: 14px;
+        bottom: 14px;
+        width: 2px;
+        background: var(--line);
+        transform: translateX(-50%);
+        z-index: 0;
+      }
+
+      .timeline-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: var(--cyan-dark);
+        border: 2px solid #ffffff;
+        box-shadow: 0 0 0 1px var(--cyan-dark);
+        margin-top: 10px;
+        z-index: 1;
+      }
+
+      .timeline-year {
+        font-size: 10px;
+        font-weight: 700;
+        color: var(--cyan-dark);
+        white-space: nowrap;
+        margin-top: 6px;
+        text-align: center;
+      }
+
+      .timeline-box {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px 16px;
+        margin-bottom: 26px;
+      }
+
+      .timeline-box.left {
+        border-right: 3px solid var(--cyan-dark);
+      }
+
+      .timeline-box.right {
+        border-left: 3px solid var(--ink);
+      }
+
+      .timeline-box-title {
+        font-size: 13px;
+        font-weight: 750;
+        color: var(--ink);
+        margin-bottom: 4px;
+      }
+
+      .timeline-box-desc {
+        font-size: 12px;
+        color: #53666e;
+        line-height: 1.5;
+      }
+
       @media (max-width: 900px) {
         .sidebar { width: 190px; }
         .main { margin-left: 190px; padding: 30px; }
@@ -385,8 +560,8 @@ ui <- fluidPage(
             type = "pills",
             tabPanel(
               "Work & Study",
-              div(class = "panel-card", style = "margin-top:22px;",
-                  p(class = "placeholder-note", "Content to be added.")
+              div(style = "margin-top:22px;",
+                  render_timeline(work_study_timeline)
               )
             ),
             tabPanel(
