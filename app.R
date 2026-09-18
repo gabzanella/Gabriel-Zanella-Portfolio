@@ -5,129 +5,240 @@
 library(shiny)
 library(shinydashboard)
 library(ggplot2)
+library(mhsmm)
+library(Isinglandr)
+library(qgraph)
 
 
 # -----------------------------
-# Hypothetical dynamic model
+# HSMM symptom-state simulation (Data analysis > Simulation)
 # -----------------------------
+# Simulates one person's EMA time series under a 3-state Hidden Semi-Markov
+# Model (Low / Moderate / High symptom severity) using the mhsmm package,
+# then builds the two-panel presentation figure: a schematic of the state /
+# duration / observation structure, and the segmented observed series with
+# the hidden states shown as background shading.
 
-node_names <- c("Stress", "Anhedonia", "Insomnia", "Fatigue", "Activity")
+hsmm_state_names   <- c("Low", "Moderate", "High")
+hsmm_state_means   <- c(0.15, 0.45, 0.80)
+hsmm_state_sds     <- c(0.08, 0.10, 0.10)
+hsmm_sojourn_mean  <- c(40, 15, 10)
+hsmm_target_length <- 200
+hsmm_n_segments    <- 30
+hsmm_seed          <- 42
+hsmm_colors        <- c(Low = "#b7e4c7", Moderate = "#ffd9a0", High = "#f4a6a6")
 
-node_abbr <- c(
-  Stress = "S",
-  Anhedonia = "A",
-  Insomnia = "I",
-  Fatigue = "F",
-  Activity = "C"
-)
+hsmm_init <- c(1, 0, 0)
 
-# Baseline state: low/moderate symptom activation.
-baseline <- c(
-  Stress = 0.8,
-  Anhedonia = 0.8,
-  Insomnia = 0.8,
-  Fatigue = 0.8,
-  Activity = 0.8
-)
+# Excludes self-transitions: duration is handled by the sojourn
+# distribution, not the transition matrix.
+hsmm_transition <- matrix(c(
+  0,   0.9, 0.1,
+  0.5, 0,   0.5,
+  0.1, 0.9, 0
+), nrow = 3, byrow = TRUE)
 
-# Base directed temporal coupling matrix.
-# Rows = receiving node at t+1
-# Columns = predictor node at t
-# These are illustrative, not empirical estimates.
-base_A <- matrix(
-  c(
-    0.55, 0.00, 0.00, 0.00, 0.05,  # Stress
-    0.20, 0.55, 0.00, 0.15, 0.00,  # Anhedonia
-    0.15, 0.18, 0.55, 0.10, 0.00,  # Insomnia
-    0.05, 0.12, 0.22, 0.55, 0.12,  # Fatigue
-    0.00, 0.00, -0.15, -0.15, 0.60 # Activity
-  ),
-  nrow = 5,
-  byrow = TRUE,
-  dimnames = list(node_names, node_names)
-)
-
-# Recovery pulls the system toward baseline.
-simulate_network <- function(
-    perturb_target = "Anhedonia",
-    perturbation = 1.0,
-    coupling = 0.55,
-    recovery = 0.30,
-    days = 40,
-    noise = 0.035
-) {
-  n <- length(node_names)
-  
-  A <- base_A
-  diag(A) <- diag(base_A) * (0.70 + 0.30 * coupling)
-  
-  for (r in seq_len(n)) {
-    for (c in seq_len(n)) {
-      if (r != c) {
-        A[r, c] <- base_A[r, c] * (coupling / 0.55)
-      }
-    }
-  }
-  
-  # Small saturating nonlinearity so very high activation does not grow
-  # without bound.
-  squash <- function(x) {
-    pmax(0, pmin(6, x))
-  }
-  
-  X <- matrix(NA_real_, nrow = days, ncol = n,
-              dimnames = list(NULL, node_names))
-  X[1, ] <- baseline
-  
-  target_index <- match(perturb_target, node_names)
-  X[1, target_index] <- X[1, target_index] + perturbation
-  
-  for (t in 2:days) {
-    previous <- X[t - 1, ]
-    
-    propagated <- as.numeric(A %*% previous)
-    next_state <- (1 - recovery) * propagated + recovery * baseline
-    next_state <- squash(next_state)
-    next_state <- next_state + rnorm(n, mean = 0, sd = noise)
-    X[t, ] <- squash(next_state)
-  }
-  
-  data.frame(
-    day = seq_len(days),
-    X,
-    check.names = FALSE
+# Builds the HSMM, simulates one realization, and returns both the
+# timepoint-level series and the run-length (contiguous same-state) table
+# used by both panels.
+hsmm_build_simulation <- function() {
+  model <- hsmmspec(
+    init = hsmm_init,
+    transition = hsmm_transition,
+    # mhsmm's rnorm.hsmm/dnorm.hsmm take sigma as variance (they call
+    # sqrt(sigma) internally), so the SDs above are squared here.
+    parms.emission = list(mu = hsmm_state_means, sigma = hsmm_state_sds^2),
+    sojourn = list(type = "poisson", lambda = hsmm_sojourn_mean, shift = rep(1, 3)),
+    dens.emission = dnorm.hsmm
   )
+
+  # nsim here is a number of state SEGMENTS (embedded-chain draws), not
+  # timepoints, so we over-simulate and truncate to the target length.
+  sim <- simulate(model, nsim = hsmm_n_segments, seed = hsmm_seed, rand.emission = rnorm.hsmm)
+
+  states <- sim$s[seq_len(hsmm_target_length)]
+  scores <- pmin(pmax(sim$x[seq_len(hsmm_target_length)], 0), 1)
+  time <- seq(as.POSIXct("2026-01-05 08:00:00", tz = "UTC"), by = "3 hours", length.out = hsmm_target_length)
+
+  df <- data.frame(
+    t = seq_len(hsmm_target_length),
+    time = time,
+    state = factor(hsmm_state_names[states], levels = hsmm_state_names),
+    score = scores
+  )
+
+  runs <- rle(as.integer(states))
+  run_end <- cumsum(runs$lengths)
+  run_start <- run_end - runs$lengths + 1
+  run_df <- data.frame(
+    state = factor(hsmm_state_names[runs$values], levels = hsmm_state_names),
+    start = run_start,
+    end = run_end,
+    start_time = time[run_start],
+    end_time = time[run_end]
+  )
+
+  list(df = df, run_df = run_df)
 }
 
-# Simple stability proxy based on the spectral radius of the temporal matrix.
-system_stability <- function(coupling = 0.55, recovery = 0.30) {
-  A <- base_A
-  
-  for (r in seq_along(node_names)) {
-    for (c in seq_along(node_names)) {
-      if (r != c) {
-        A[r, c] <- base_A[r, c] * (coupling / 0.55)
-      }
-    }
+# Panel 1: schematic of the state / duration / observation structure, drawn
+# from the first `n_show` contiguous state segments (not the full series).
+hsmm_schematic_plot <- function(run_df, n_show = 4) {
+  seg <- run_df[seq_len(n_show), ]
+  seg$idx <- seq_len(n_show)
+  seg$duration <- seg$end - seg$start + 1
+  seg$box_x <- seg$idx
+  seg$obs_label <- paste0("x_", seg$start, ", ..., x_", seg$end)
+  seg$state_label <- paste0("State ", match(as.character(seg$state), hsmm_state_names), " - ", seg$state)
+  seg$dur_label <- paste0(seg$duration, " timepoints")
+
+  box_w <- 0.8; box_h <- 0.5
+  box_y <- 2; oval_y <- 0.6
+  oval_rx <- 0.42; oval_ry <- 0.32
+
+  ellipse_pts <- function(cx, cy, rx, ry, id, n = 60) {
+    th <- seq(0, 2 * pi, length.out = n)
+    data.frame(x = cx + rx * cos(th), y = cy + ry * sin(th), id = id)
   }
-  
-  A_eff <- (1 - recovery) * A
-  eigenvalues <- eigen(A_eff, only.values = TRUE)$values
-  max_modulus <- max(Mod(eigenvalues))
-  
-  if (max_modulus < 0.90) {
-    state <- "Stable / recovery likely"
-  } else if (max_modulus < 1.00) {
-    state <- "Near criticality"
-  } else {
-    state <- "Potential amplification"
+  ovals <- do.call(rbind, lapply(seq_len(n_show), function(i) {
+    ellipse_pts(seg$box_x[i], oval_y, oval_rx, oval_ry, i)
+  }))
+
+  p <- ggplot() +
+    geom_rect(
+      data = seg,
+      aes(xmin = box_x - box_w / 2, xmax = box_x + box_w / 2,
+          ymin = box_y - box_h / 2, ymax = box_y + box_h / 2, fill = state),
+      color = "#10212b", linewidth = 0.4
+    ) +
+    geom_text(data = seg, aes(x = box_x, y = box_y + 0.08, label = state_label), size = 3.2, fontface = "bold") +
+    geom_text(data = seg, aes(x = box_x, y = box_y - 0.14, label = dur_label), size = 2.8) +
+    geom_polygon(data = ovals, aes(x = x, y = y, group = id), fill = "white", color = "#10212b", linewidth = 0.4) +
+    geom_text(data = seg, aes(x = box_x, y = oval_y, label = obs_label), size = 2.6) +
+    geom_segment(
+      data = seg,
+      aes(x = box_x, xend = box_x, y = box_y - box_h / 2, yend = oval_y + oval_ry + 0.05),
+      arrow = arrow(length = unit(0.12, "cm")), color = "#53666e"
+    ) +
+    scale_fill_manual(values = hsmm_colors, guide = "none") +
+    xlim(0.3, n_show + 0.7) + ylim(0, 2.7) +
+    theme_void()
+
+  if (n_show > 1) {
+    p <- p + geom_segment(
+      data = seg[-n_show, ],
+      aes(x = box_x + box_w / 2, xend = box_x + 1 - box_w / 2, y = box_y, yend = box_y),
+      arrow = arrow(length = unit(0.15, "cm")), color = "#10212b"
+    )
   }
-  
-  list(
-    spectral_radius = max_modulus,
-    state = state
-  )
+
+  p
 }
+
+# Panel 2: the full observed series with background shading per hidden state.
+hsmm_segmented_plot <- function(df, run_df) {
+  ggplot() +
+    geom_rect(
+      data = run_df,
+      aes(xmin = start_time, xmax = end_time, ymin = -Inf, ymax = Inf, fill = state),
+      alpha = 0.55
+    ) +
+    geom_line(data = df, aes(x = time, y = score), color = "#10212b", linewidth = 0.6) +
+    scale_fill_manual(values = hsmm_colors, name = "Hidden state") +
+    scale_x_datetime(name = "Assessment time") +
+    scale_y_continuous(name = "Symptom score", limits = c(0, 1)) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+}
+
+hsmm_sim_data <- hsmm_build_simulation()
+
+# -----------------------------
+# Ising landscape simulation (Data analysis > Simulation 2.0)
+# -----------------------------
+# CONCEPTUAL ILLUSTRATION ONLY: a binary Ising model showing how symptom
+# connectivity reshapes a system's stability landscape (low / moderate /
+# high connectivity). This is a different, simpler model than the
+# project's actual empirical pipeline (continuous EMA data with
+# graphicalVAR / partial-correlation networks) -- used here purely to
+# visualize the theoretical mechanism.
+#
+# The full script below is kept as a single string and eval()'d once, so
+# the "Code 2.0" tab can display exactly the code that produced these
+# panels (no risk of the displayed code drifting from what actually ran).
+ising_script <- r"---(
+library(Isinglandr)
+library(qgraph)
+library(ggplot2)
+
+# ---- toy network: 8 depression-adjacent symptoms ----
+Nvar <- 8
+node_labels <- c("Sad mood", "Anhedonia", "Fatigue", "Sleep problems",
+                  "Concentration", "Appetite", "Guilt", "Psychomotor")
+fatigue_idx <- which(node_labels == "Fatigue")
+
+m <- rep(-3, Nvar)                                    # thresholds (shared across conditions)
+w_base <- matrix(0.1, Nvar, Nvar); diag(w_base) <- 0  # base low-connectivity weights
+
+# Connectivity multipliers -- tuned empirically (not hardcoded blindly) by
+# scanning the landscape's local minima across a range of multipliers:
+# mult=1 gives a single well (low, resilient); bimodality (two competing
+# wells) first appears around mult=8-9; by mult=18 the high-symptom well
+# dominates almost completely (near-absorbing high state).
+mult_low  <- 1    # low connectivity
+mult_mod  <- 9    # moderate connectivity: genuinely bimodal landscape
+mult_high <- 18   # high connectivity: single dominant high-symptom well
+
+seed <- 1614
+sim_length <- 300
+# Simulation "temperature": tuned so the moderate condition shows visible
+# switching between plateaus within sim_length steps; applied identically
+# to all three conditions so only connectivity differs between them.
+beta2_sim <- 0.45
+
+w_low  <- w_base * mult_low
+w_mod  <- w_base * mult_mod
+w_high <- w_base * mult_high
+
+# ---- stability landscapes (middle column) ----
+result_low  <- make_2d_Isingland(m, w_low)
+result_mod  <- make_2d_Isingland(m, w_mod)
+result_high <- make_2d_Isingland(m, w_high)
+
+# ---- simulated trajectories (right column) ----
+set.seed(seed); sim_low  <- simulate_Isingland(result_low,  initial = 0, length = sim_length, beta2 = beta2_sim)
+set.seed(seed); sim_mod  <- simulate_Isingland(result_mod,  initial = 0, length = sim_length, beta2 = beta2_sim)
+set.seed(seed); sim_high <- simulate_Isingland(result_high, initial = 0, length = sim_length, beta2 = beta2_sim)
+
+# ---- panel builders ----
+
+# Left column: the symptom network itself (qgraph, not part of Isinglandr),
+# with "Fatigue" highlighted and edge thickness on a common scale across
+# all three conditions so the increase in connectivity is visible.
+ising_network_plot <- function(w, title) {
+  node_colors <- rep("#dcf8fb", Nvar)
+  node_colors[fatigue_idx] <- "#ffd9a0"
+  qgraph(w, labels = node_labels, layout = "circle",
+         color = node_colors, edge.color = "#087f8d",
+         label.cex = 0.9, label.scale = FALSE, vsize = 13, esize = 8,
+         maximum = max(w_high), title = title, title.cex = 1.2)
+}
+
+# Right column: the simulated symptom-count trajectory. Built directly
+# from sim$output rather than plot.sim_Isingland(), which returns an
+# animated (gganimate) plot -- not appropriate for a static figure.
+ising_timeseries_plot <- function(sim, title) {
+  ggplot(sim$output, aes(x = time, y = n_active)) +
+    geom_line(color = "#10212b", linewidth = 0.5) +
+    scale_y_continuous(name = "Active symptoms", limits = c(0, Nvar)) +
+    scale_x_continuous(name = "Simulated time step") +
+    ggtitle(title) +
+    theme_minimal(base_size = 11)
+}
+)---"
+
+ising_env <- new.env()
+eval(parse(text = ising_script), envir = ising_env)
 
 # -----------------------------
 # Complex systems demo: bio-psycho-social feature network
@@ -260,7 +371,10 @@ work_study_timeline <- list(
        description = "Contextual Consulting (UK). Clinical training."),
   list(side = "left",  year = "2026",
        title = "Clinical Psychology Internship",
-       description = "Overcome, UK.<br>Supervised practice delivering one-to-one psychological coaching sessions to international clients with evidence-based techniques (CBT & ACT).")
+       description = "Overcome, UK.<br>Supervised practice delivering one-to-one psychological coaching sessions to international clients with evidence-based techniques (CBT & ACT)."),
+  list(side = "left",  year = "2026",
+       title = "MicroMaster in Statistics and Data Science (started)",
+       description = "MITx. Online program focused on probability, data analysis and machine learning with Python.")
 )
 
 # Timeline render
@@ -290,6 +404,84 @@ render_timeline <- function(items) {
       div(class = "timeline-columns",
           div(class = "timeline-col", lapply(left_items, timeline_box)),
           div(class = "timeline-col", lapply(right_items, timeline_box))
+      )
+  )
+}
+
+# -----------------------------
+# Deduction flowchart (Framework page)
+# -----------------------------
+# Two-column research-cycle diagram: a stage label on the left (e.g.
+# "Theory"), its content on the right in the same row, and a down-arrow
+# connecting consecutive labels in the left column only (the same paired
+# left/right correspondence style used on the Research design page).
+
+# Small centered label box for the left column.
+flow_label <- function(label) {
+  div(class = "panel-card",
+      style = "display:flex; align-items:center; justify-content:center; text-align:center; min-height:64px;",
+      div(class = "eyebrow", style = "margin:0;", label)
+  )
+}
+
+# Content box for the right column. `items` is a list of
+# list(title = "..." or NULL, text = "...").
+flow_content <- function(items) {
+  div(class = "panel-card",
+      lapply(items, function(it) {
+        div(style = "margin-bottom:10px;",
+            if (!is.null(it$title)) tags$strong(paste0(it$title, ": ")),
+            span(class = "card-text", HTML(it$text))
+        )
+      })
+  )
+}
+
+# Down-arrow occupying only the left-column cell of a grid row.
+flow_row_arrow <- function() {
+  div(style = "display:flex; align-items:center; justify-content:center; padding:2px 0;",
+      icon("arrow-down", style = "font-size:18px; color:#8a9aa1;")
+  )
+}
+
+# -----------------------------
+# Publication list (About > Previous research)
+# -----------------------------
+# One list, oldest to newest, with a coloured category badge on the left
+# (Article / Book chapter / Poster) instead of separate section headers.
+pub_category_colors <- list(
+  Article      = c(bg = "#dcf8fb", fg = "#087f8d"),
+  "Book chapter" = c(bg = "#ece5f8", fg = "#5b3a99"),
+  Poster       = c(bg = "#fbeadd", fg = "#993c1d")
+)
+
+pub_entry <- function(category, html_text) {
+  colors <- pub_category_colors[[category]]
+
+  div(style = "display:flex; align-items:flex-start; gap:14px; margin-bottom:18px;",
+      div(style = paste0(
+            "flex-shrink:0; min-width:96px; text-align:center; padding:4px 10px; ",
+            "border-radius:8px; font-size:11px; font-weight:700; letter-spacing:0.04em; ",
+            "text-transform:uppercase; background:", colors[["bg"]], "; color:", colors[["fg"]], ";"
+          ),
+          category
+      ),
+      p(class = "reference-item", style = "margin-bottom:0; padding-left:0; text-indent:0;", HTML(html_text))
+  )
+}
+
+# -----------------------------
+# Time-series data pipeline stepper (Data analysis page)
+# -----------------------------
+# One numbered step in the vertical stepper: a circled number, bold title,
+# one-sentence description, and a row of small tool-tag pills.
+step_item <- function(number, title, desc, tool_tags) {
+  div(class = "step-row",
+      div(class = "step-circle", number),
+      div(
+        div(class = "step-title", title),
+        p(class = "step-desc", desc),
+        div(lapply(tool_tags, function(t) span(class = "tool-tag", t)))
       )
   )
 }
@@ -471,6 +663,80 @@ ui <- fluidPage(
         margin-top: 4px;
       }
 
+      .reference-item {
+        font-size: 14px;
+        line-height: 1.65;
+        color: var(--ink);
+        padding-left: 28px;
+        text-indent: -28px;
+        margin-bottom: 16px;
+      }
+
+      .reference-item a { color: var(--cyan-dark); }
+
+      .kicker-mono {
+        font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #087f8d;
+        font-weight: 700;
+        margin-bottom: 8px;
+      }
+
+      .stepper {
+        position: relative;
+        margin: 4px 0 20px;
+      }
+
+      .stepper::before {
+        content: '';
+        position: absolute;
+        left: 19px;
+        top: 6px;
+        bottom: 6px;
+        width: 2px;
+        background: var(--line);
+        z-index: 0;
+      }
+
+      .step-row {
+        position: relative;
+        display: flex;
+        gap: 18px;
+        margin-bottom: 26px;
+        z-index: 1;
+      }
+
+      .step-circle {
+        flex-shrink: 0;
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: #087f8d;
+        color: #ffffff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 750;
+        font-size: 13px;
+      }
+
+      .step-title { font-weight: 750; color: #10212b; margin-bottom: 4px; }
+      .step-desc { font-size: 14px; line-height: 1.6; color: #53666e; margin-bottom: 10px; }
+
+      .tool-tag {
+        display: inline-block;
+        background: #f1f5f7;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 3px 10px;
+        font-size: 11px;
+        color: #53666e;
+        margin-right: 6px;
+        margin-bottom: 6px;
+      }
+
       .panel-card {
         background: var(--panel);
         border: 1px solid var(--line);
@@ -511,6 +777,9 @@ ui <- fluidPage(
       .card-pastel-3 { background: #ece5f8; }
       .card-pastel-4 { background: #eaf5df; }
       .card-pastel-5 { background: #fbe4ea; }
+      .card-pastel-6 { background: #fdf2c4; }
+
+      .feature-card-icon { font-size: 24px; color: #10212b; margin-bottom: 10px; display: block; }
 
       .card-icon { font-size: 22px; color: #087f8d; margin-bottom: 8px; display: block; }
 
@@ -688,6 +957,7 @@ ui <- fluidPage(
         h1 { font-size: 26px; }
         .timeline-columns-header,
         .timeline-columns { grid-template-columns: 1fr; }
+        .framework-flow { grid-template-columns: 1fr !important; }
       }
     "))
   ),
@@ -702,9 +972,9 @@ ui <- fluidPage(
         id = "main_tabs",
         menuItem("Home", tabName = "home", icon = NULL),
         menuItem("About", tabName = "about", icon = NULL),
-        menuItem("Theoretical Framework", tabName = "theory", icon = NULL),
+        menuItem("Framework", tabName = "theory", icon = NULL),
         menuItem("Research design", tabName = "design", icon = NULL),
-        menuItem("Network model", tabName = "network", icon = NULL),
+        menuItem("Data analysis", tabName = "network", icon = NULL),
         menuItem("Contribution", tabName = "contribution", icon = NULL),
         menuItem("References", tabName = "references", icon = NULL)
       ),
@@ -728,21 +998,22 @@ ui <- fluidPage(
                   p(class = "lead", style = "margin-bottom:10px;", "Hello!"),
                   p(class = "lead",
                     "My name is Gabriel Zanella. I am a quantitative researcher and teacher with expertise in clinical psychology and statistical modelling. Skilled in R-based data analysis, network models, university teaching and interdisciplinary mental health research. Interested in computational psychopathology and dynamic systems approach to mental health problems."
+                  ),
+                  div(class = "social-links", style = "margin-top:10px;",
+                      span(class = "social-link", icon("envelope"), "gabriel.i.zanella@gmail.com"),
+                      span(class = "social-link", icon("phone"), "+31 616307092"),
+                      tags$a(href = "https://orcid.org/0009-0002-2499-6159", class = "social-link",
+                             target = "_blank", icon("orcid"), "ORCID"),
+                      tags$a(href = "https://github.com/gabzanella", class = "social-link",
+                             target = "_blank", icon("github"), "GitHub"),
+                      tags$a(href = "https://linkedin.com/in/zanellagabriel/", class = "social-link",
+                             target = "_blank", icon("linkedin"), "LinkedIn")
                   )
                 ),
                 column(
                   width = 5,
                   img(src = "profile.png", class = "intro-photo", alt = "Gabriel Zanella")
                 )
-              ),
-              div(class = "social-links", style = "margin-top:8px;",
-                  span(class = "social-link", icon("envelope"), "gabriel.i.zanella@gmail.com"),
-                  tags$a(href = "https://orcid.org/0009-0002-2499-6159", class = "social-link",
-                         target = "_blank", icon("orcid"), "ORCID"),
-                  tags$a(href = "https://github.com/gabzanella", class = "social-link",
-                         target = "_blank", icon("github"), "GitHub"),
-                  tags$a(href = "https://linkedin.com/in/zanellagabriel/", class = "social-link",
-                         target = "_blank", icon("linkedin"), "LinkedIn")
               ),
               fluidRow(
                 style = "margin-top:18px;",
@@ -786,9 +1057,75 @@ ui <- fluidPage(
               )
             ),
             tabPanel(
+              "Master's Thesis",
+              div(style = "margin-top:22px;",
+                  p(class = "lead", style = "margin-bottom:20px;",
+                    "Master's thesis project (Clinical Psychology, Utrecht University, 2022), supervised by Dr. Lynn Boschloo."
+                  ),
+                  fluidRow(
+                    column(
+                      width = 6,
+                      div(class = "panel-card card-pastel-1", style = "height:100%;",
+                          h3("Introduction"),
+                          p(class = "card-text", "The presence of parental depression and/or anxiety can disrupt family functioning – here defined in the dimensions of cohesion (the emotional connection between family members) and flexibility (family rules and negotiations). This study investigated the associations between family functioning dimensions and the presence of symptoms of depression and anxiety in the offspring of parents treated for depression/anxiety disorders.")
+                      )
+                    ),
+                    column(
+                      width = 6,
+                      div(class = "panel-card card-pastel-2", style = "height:100%;",
+                          h3("Methods"),
+                          tags$ul(class = "card-text", style = "padding-left:18px; margin:0;",
+                              tags$li(tags$strong("Design: "), "cross-sectional"),
+                              tags$li(tags$strong("Sample: "), "483 offspring (13 to 25 years) of parents treated for depression/anxiety"),
+                              tags$li(tags$strong("Analyses: "), "Multiple linear regression examined associations of cohesion and flexibility with the number of symptoms in offspring; logistic regressions were performed for each of the symptoms; a network was estimated, with a mixed graphical model of how each symptom of mental health disorder (nodes) connects directly or indirectly to each other and to the family functioning dimensions."),
+                              tags$li(tags$strong("Code: "), actionButton("thesis_code_btn", "View code", class = "btn-primary", style = "padding:3px 12px; font-size:12px; margin-left:4px;"))
+                          )
+                      )
+                    )
+                  ),
+                  fluidRow(
+                    style = "margin-top:18px;",
+                    column(
+                      width = 12,
+                      div(class = "panel-card", style = "padding:32px;",
+                          h2(style = "margin-top:0;", "Results"),
+                          img(
+                            src = "thesis-network.png",
+                            style = "max-width:700px; width:100%; display:block; margin:0 auto 16px auto; border-radius:10px;",
+                            alt = "Estimated network of family functioning dimensions and offspring symptoms"
+                          ),
+                          p(class = "card-text", style = "max-width:760px; margin:0 auto;",
+                            "In the network structure, cohesion showed two negative links to symptoms (anhedonia and suicidality) and one positive link (insomnia), whereas flexibility showed two positive links (guilt and insomnia). Bold lines indicate stronger connections."
+                          )
+                      )
+                    )
+                  ),
+                  fluidRow(
+                    style = "margin-top:18px;",
+                    column(
+                      width = 12,
+                      div(class = "panel-card card-pastel-3",
+                          h3("Discussion"),
+                          p(class = "card-text", "High family cohesion has a protective role in offspring depression/anxiety, especially against anhedonia, sadness and worthlessness. Excessive family flexibility is detrimental to offspring, especially via guilt and sleeping problems that are further related to anxiety. Findings suggest that different family factors relate to distinct pathways of symptoms in the offspring and that family interventions should increase cohesion and reduce excessive flexibility.")
+                      )
+                    )
+                  ),
+                  div(class = "small-muted", style = "margin-top:14px;",
+                      "URI: ",
+                      tags$a(href = "https://studenttheses.uu.nl/handle/20.500.12932/41957", target = "_blank",
+                             "studenttheses.uu.nl/handle/20.500.12932/41957")
+                  )
+              )
+            ),
+            tabPanel(
               "Previous research",
               div(class = "panel-card", style = "margin-top:22px;",
-                  p(class = "placeholder-note", "Content to be added.")
+                  pub_entry("Book chapter", "Catelan, R., Bercht, A., Pase, P., Stucky, J., Chinazzo, I., Vezzosi, J. P., Azevedo, F., Brazil, A., Portalino, E., Ramos, M., Zanella, G., Lucas, A., & Costa, A. (2019). Sexual and gender diversity: Theoretical models from recent research in Brazil. In <em>Prejudice and social exclusion: Studies in psychology in Brazil</em> (1st ed., pp. 180–217). ISBN: 978-85-509-0501-3."),
+                  pub_entry("Article", "Fontanari, A. M. V., Zanella, G., Feijo, M., Churchill, S., Lobato, M. I., & Costa, A. B. (2019). HIV-related care for transgender people: A systematic review of studies from around the world. <em>Social Science & Medicine, 230</em>, 280–294. <a href=\"https://doi.org/10.1016/j.socscimed.2019.03.016\" target=\"_blank\">https://doi.org/10.1016/j.socscimed.2019.03.016</a>"),
+                  pub_entry("Article", "Catelan, R., Sbicigo, J., Azevedo, M., Vilanova, F., Silva, P., Zanella, G., Ramos, M., Costa, A. B., & Nardi, H. C. (2020). Anticipated stigma in HIV testing among Brazilian male soldiers. <em>Psychology & Sexuality, 13</em>(2), 1–26. <a href=\"https://doi.org/10.1080/19419899.2020.1773909\" target=\"_blank\">https://doi.org/10.1080/19419899.2020.1773909</a>"),
+                  pub_entry("Article", "Pase, P., Schultz Aguida, L., Lucas, A., Zanella, G., Ignácio, G., Stock, S., Dotta, M., & Costa, A. B. (2021). Gender relations in healthcare work in a female prison facility. <em>Psychosocial Researches and Practices, 16</em>(3), 1–17. <a href=\"https://seer.ufsj.edu.br/revista_ppp/article/view/e3256\" target=\"_blank\">seer.ufsj.edu.br/revista_ppp/article/view/e3256</a>"),
+                  pub_entry("Poster", "Monteiro, R., Bolzan, P., Comissoli, T., Zanella, G., & Ferrao, Y. (2025). Emotional response to suicidal patients and burnout syndrome: The impact on physicians’ mental health. <em>European Congress of Psychiatry 2025</em>, S342–S343. <a href=\"https://doi.org/10.1192/j.eurpsy.2025.727\" target=\"_blank\">doi.org/10.1192/j.eurpsy.2025.727</a>"),
+                  pub_entry("Poster", "Monteiro, R., Bolzan, P., Comissoli, T., Zanella, G., & Ferrao, Y. (2025). Relations between physicians’ emotional response and stigma around suicide. <em>European Congress of Psychiatry 2025</em>, S225. <a href=\"https://doi.org/10.1192/j.eurpsy.2025.51\" target=\"_blank\">doi.org/10.1192/j.eurpsy.2025.51</a>")
               )
             ),
             tabPanel(
@@ -817,11 +1154,66 @@ ui <- fluidPage(
         # 3. Theoretical Framework
         tabItem(
           tabName = "theory",
-          div(class = "eyebrow", "Theoretical framework"),
-          h2("Theoretical framework"),
+          div(class = "eyebrow", "Framework"),
+          h2("Framework"),
           tabsetPanel(
             id = "theory_tabs",
             type = "pills",
+            tabPanel(
+              "Deduction",
+              div(style = "margin-top:22px;",
+                  p(class = "lead", "The research cycle in which this PhD project is nested — from theory to empirical test, and back to implications for theory and practice."),
+                  div(class = "framework-flow", style = "display:grid; grid-template-columns:200px 1fr; gap:12px 24px; align-items:stretch;",
+                      flow_label("Theory"),
+                      flow_content(list(
+                        list(title = NULL, text = "<b>Central tenet:</b> Mental disorders arise from the causal interaction between symptoms in a network (Borsboom, 2017).")
+                      )),
+                      flow_row_arrow(), div(),
+                      flow_label("Principles and concepts"),
+                      flow_content(list(
+                        list(title = "Complex systems", text = "Interactions between numerous biological, psychological, and social features. (Fried, 2022)."),
+                        list(title = "Mental states", text = "Emergent properties arising out of interactions across complex systems. (Fried, 2022)."),
+                        list(title = "Stable state", text = "In a dynamical system, a stable state (or “attractor” state) is a point in the system’s state space the system will tend to move toward and remain in over time.")
+                      )),
+                      flow_row_arrow(), div(),
+                      flow_label("Predictions"),
+                      div(class = "panel-card",
+                          tags$ul(class = "card-text", style = "padding-left:18px; margin:0;",
+                              tags$li("Complex systems can transition and settle into attractor states."),
+                              tags$li("Perturbations can affect complex systems; more severe perturbations lead to transition into alternative states more easily."),
+                              tags$li("Removing the perturbation does not return the system to prior state."),
+                              tags$li("Positive feedback loops increase the magnitude of a perturbation to the system."),
+                              tags$li("Negative feedback loops dampen the perturbation to the system."),
+                              tags$li("Complex systems can be more vulnerable or resilient to alternative states."),
+                              tags$li("The effect of interventions on systems depends on the history of the systems."),
+                              tags$li("Interventions with greater impact on the system indicate larger changes in the system.")
+                          )
+                      ),
+                      flow_row_arrow(), div(),
+                      flow_label("Empirical data"),
+                      flow_content(list(
+                        list(title = "Cross-sectional observational data", text = "Individual differences networks."),
+                        list(title = "Time-series longitudinal patient data", text = "Temporal and contemporaneous networks.")
+                      )),
+                      flow_row_arrow(), div(),
+                      flow_label("Statistical analyses"),
+                      div(class = "panel-card",
+                          tags$strong("Network estimation:"),
+                          tags$ul(class = "card-text", style = "padding-left:18px; margin:6px 0 0;",
+                              tags$li("Gaussian graphical models"),
+                              tags$li("Mixed graphical models"),
+                              tags$li("Multilevel graphical vector autoregression")
+                          )
+                      ),
+                      flow_row_arrow(), div(),
+                      flow_label("Implications"),
+                      flow_content(list(
+                        list(title = "Theory", text = "Empirical evidence for or against specific dynamical predictions of network theory."),
+                        list(title = "Practice", text = "Establishing evidence-based practice and refining the treatment protocol.")
+                      ))
+                  )
+              )
+            ),
             tabPanel(
               "Network approach",
               div(style = "margin-top:22px;",
@@ -964,81 +1356,227 @@ ui <- fluidPage(
           tabName = "design",
           div(class = "eyebrow", "Research design"),
           h2("Research design"),
-          p(class = "placeholder-note", "Content to be added.")
+          div(style = "margin-top:22px;",
+              p(class = "lead", style = "margin-bottom:22px;",
+                "Project: Empirical study on harmful stable states for testing the network theory of mental disorders."
+              ),
+              div(class = "panel-card", style = "margin-bottom:24px; border-color:#087f8d;",
+                  div(style = "display:flex; align-items:center; gap:10px; margin-bottom:8px;",
+                      icon("magnifying-glass", style = "font-size:20px; color:#087f8d;"),
+                      h3(style = "margin:0;", "Research question")
+                  ),
+                  p(class = "card-text", style = "font-size:18px; line-height:1.6;", HTML(
+                    "How do putative harmful stable states <strong style=\"color:#087f8d;\">emerge</strong>, <strong style=\"color:#c2410c;\">evolve</strong>, and <strong style=\"color:#5b3a99;\">respond</strong> to targeted intervention in mental-health networks?"
+                  ))
+              ),
+              div(style = "display:flex; flex-direction:column; gap:18px;",
+                  div(style = "display:grid; grid-template-columns: 1fr 50px 1fr; gap:8px;",
+                      actionLink("rq_toggle1",
+                          label = tagList(
+                            h3("Aim 1 - Identifying"),
+                            p(class = "card-text", "What are the recurring states in networks of mental health problems?")
+                          ),
+                          class = "panel-card card-pastel-1",
+                          style = "display:block; text-decoration:none; color:inherit; cursor:pointer;"
+                      ),
+                      conditionalPanel(condition = "input.rq_toggle1 % 2 == 1",
+                          div(style = "display:flex; align-items:center; justify-content:center; height:100%;",
+                              icon("arrow-right", style = "font-size:22px; color:#10212b;")
+                          )
+                      ),
+                      conditionalPanel(condition = "input.rq_toggle1 % 2 == 1",
+                          div(class = "panel-card card-pastel-1",
+                              tags$ul(class = "card-text", style = "padding-left:18px; margin:0;",
+                                  tags$li("Literature review"),
+                                  tags$li("Analyse the collected time-series dataset"),
+                                  tags$li("A statistical model to identify recurrent states based on symptom fluctuations over time (EMA data)"),
+                                  tags$li("Hidden Semi-Markov Model (HSMM) fit per person (to address symptom duration)"),
+                                  tags$li("Network-comparison follow-up check: differences in configuration or severity?"),
+                              )
+                          )
+                      )
+                  ),
+                  div(style = "display:grid; grid-template-columns: 1fr 50px 1fr; gap:8px;",
+                      actionLink("rq_toggle2",
+                          label = tagList(
+                            h3("Aim 2 - Explaining"),
+                            p(class = "card-text", "What are the dynamical properties of persistence and transition of states in such networks?")
+                          ),
+                          class = "panel-card card-pastel-2",
+                          style = "display:block; text-decoration:none; color:inherit; cursor:pointer;"
+                      ),
+                      conditionalPanel(condition = "input.rq_toggle2 % 2 == 1",
+                          div(style = "display:flex; align-items:center; justify-content:center; height:100%;",
+                              icon("arrow-right", style = "font-size:22px; color:#10212b;")
+                          )
+                      ),
+                      conditionalPanel(condition = "input.rq_toggle2 % 2 == 1",
+                          div(class = "panel-card card-pastel-2",
+                              tags$ul(class = "card-text", style = "padding-left:18px; margin:0;",
+                                  tags$li("Track (in)stability and state transitions"),
+                                  tags$li("Compute autocorrelations and variance in the symptom-level time series"),
+                                  tags$li("Early-warning-signal analysis"),
+                                  tags$li("Exploratory analyses: Check network connectivity")
+                              )
+                          )
+                      )
+                  ),
+                  div(style = "display:grid; grid-template-columns: 1fr 50px 1fr; gap:8px;",
+                      actionLink("rq_toggle3",
+                          label = tagList(
+                            h3("Aim 3 - Testing"),
+                            p(class = "card-text", "How do such networks respond to element-targeted intervention?")
+                          ),
+                          class = "panel-card card-pastel-3",
+                          style = "display:block; text-decoration:none; color:inherit; cursor:pointer;"
+                      ),
+                      conditionalPanel(condition = "input.rq_toggle3 % 2 == 1",
+                          div(style = "display:flex; align-items:center; justify-content:center; height:100%;",
+                              icon("arrow-right", style = "font-size:22px; color:#10212b;")
+                          )
+                      ),
+                      conditionalPanel(condition = "input.rq_toggle3 % 2 == 1",
+                          div(class = "panel-card card-pastel-3",
+                              tags$ul(class = "card-text", style = "padding-left:18px; margin:0;",
+                                  tags$li("State characteristics and transition patterns → predicting severity, trajectory, relapse"),
+                                  tags$li("Validate networks vs. associated clinical outcomes"),
+                                  tags$li("Single-person intervention design"),
+                                  tags$li("Network Intervention Analysis: node-level vs. link-level targeting"),
+                                  tags$li("Structural vs temporal changes (follow-up)")
+                              )
+                          )
+                      )
+                  )
+              )
+          )
         ),
         
         # 5. Network model
         tabItem(
           tabName = "network",
-          div(class = "eyebrow", "Interactive model"),
-          h2("Network model"),
+          div(class = "eyebrow", "Data analysis"),
+          h2("Data analysis"),
           tabsetPanel(
             id = "network_tabs",
             type = "pills",
-            
+
+            tabPanel(
+              "Time-series data",
+              div(style = "margin-top:22px; max-width:820px;",
+                  div(class = "stepper",
+                      step_item("01", "Data collection",
+                        "Access existing longitudinal / EMA datasets.",
+                        c("OSF", "Data storage", "GDPR compliance")
+                      ),
+                      step_item("02", "Data cleaning & processing",
+                        "Combine instruments and data points into one long-format file. Manage missing data.",
+                        c("tidyverse", "codebook")
+                      ),
+                      step_item("03", "Operationalisation of symptoms",
+                        "Item coding, individual-level time series for each individual symptom/node.",
+                        c("psych", "qgraph", "corrplot", "scoring scripts")
+                      ),
+                      step_item("04", "Within-person/Idiographic model estimation",
+                        "Fit a Hidden Semi-Markov Model to individual subjects, applying model fit indices (BIC) to identify recurring symptom states and their typical duration.",
+                        c("mhsmm", "BIC comparison")
+                      ),
+                      step_item("05", "Validation of states",
+                        "Pool timepoints by assigned state, estimate a separate symptom network for each, and test whether states reflect genuinely different symptom configurations rather than the same pattern at differing severity.",
+                        c("graphicalVAR", "NetworkComparisonTest", "bootnet")
+                      ),
+                      step_item("06", "Dynamic characterization",
+                        "Read persistence and switching probability from the HSMM's transition and duration structure; compute rolling-window autocorrelation and variance in the symptom time series as early-warning indicators of an approaching state change.",
+                        c("mhsmm output", "earlywarnings", "rolling-window scripts")
+                      ),
+                      step_item("07", "Criterion validation & intervention testing",
+                        "Use per-person state features (dwell time, number of transitions) to predict clinical outcomes (relapse, severity, functioning), then run a single-person Network Intervention Analysis comparing node-level vs. link-level targeting; store and document data and derived features for reuse.",
+                        c("survival / lm", "mgm", "SQLite · OSF")
+                      )
+                  ),
+                  div(class = "disclaimer",
+                      tags$strong("Disorder-agnostic by design: "),
+                      "because the pipeline works on the derived proportion-score rather than raw item content, depression, anxiety and other diagnostic datasets pass through the same seven stations — allowing cross-disorder comparison of attractor structure before any new data collection."
+                  )
+              )
+            ),
+
             tabPanel(
               "Simulation",
               div(style = "margin-top:22px;",
                   p(class = "lead",
-                    "Live simulation generated by R. The parameters are hypothetical and are intended to illustrate the proposed analysis."
+                    "One person's simulated EMA time series under a 3-state Hidden Semi-Markov Model (Low / Moderate / High symptom severity), used to demonstrate HSMM-based state segmentation."
                   ),
-                  fluidRow(
-                    column(
-                      width = 8,
-                      div(class = "panel-card",
-                          plotOutput("network_plot", height = "580px")
-                      )
-                    ),
-                    column(
-                      width = 4,
-                      div(class = "panel-card",
-                          h3("Model controls"),
-                          selectInput(
-                            "network_target",
-                            "Perturbation target",
-                            choices = node_names,
-                            selected = "Anhedonia"
-                          ),
-                          sliderInput(
-                            "network_perturbation",
-                            "Perturbation size",
-                            min = 0, max = 5, value = 1.5, step = 0.1
-                          ),
-                          sliderInput(
-                            "network_coupling",
-                            "Coupling strength",
-                            min = 0.10, max = 1.00, value = 0.55, step = 0.05
-                          ),
-                          sliderInput(
-                            "network_recovery",
-                            "Recovery strength",
-                            min = 0.05, max = 0.80, value = 0.30, step = 0.05
-                          ),
-                          actionButton("run_network", "Run simulation", class = "btn-primary"),
-                          br(), br(),
-                          verbatimTextOutput("network_state"),
-                          div(class = "disclaimer",
-                              "Illustrative simulation only. In the empirical study, dynamic parameters would be estimated from repeated longitudinal observations."
-                          )
-                      )
-                    )
+                  div(class = "panel-card",
+                      h3("State / duration / observation structure"),
+                      p(class = "small-muted", "The first four state segments from the simulated series, shown schematically."),
+                      plotOutput("hsmm_schematic", height = "320px")
+                  ),
+                  div(class = "panel-card",
+                      h3("Segmented time series"),
+                      p(class = "small-muted", "The full simulated series, with background shading showing the true (simulated) hidden state at each timepoint."),
+                      plotOutput("hsmm_segmented", height = "380px")
+                  ),
+                  div(class = "disclaimer",
+                      "Illustrative simulation only — parameters (state means/SDs, sojourn durations, transition probabilities) are hypothetical, fixed with a random seed for reproducibility. In the empirical study, these would be estimated from real longitudinal EMA data."
                   )
               )
             ),
-            
+
             tabPanel(
               "Code",
               div(style = "margin-top:22px;",
                   div(class = "panel-card",
-                      h3("Simulation function"),
-                      p(class = "small-muted", "The R function driving the simulation shown in the Simulation tab."),
-                      verbatimTextOutput("network_code")
+                      h3("HSMM simulation & figure code"),
+                      p(class = "small-muted", "The R code used to build the simulation and the two panels shown in the Simulation tab."),
+                      verbatimTextOutput("hsmm_code")
+                  )
+              )
+            ),
+
+            tabPanel(
+              "Simulation 2.0",
+              div(style = "margin-top:22px;",
+                  div(class = "disclaimer", style = "margin-bottom:18px;",
+                      "Illustrative simulation (binary Ising model) of how symptom connectivity reshapes system stability — the empirical analysis instead uses continuous EMA data and partial-correlation networks."
+                  ),
+                  div(
+                    style = "display:grid; grid-template-columns:120px repeat(3, 1fr); gap:10px; align-items:center;",
+                    div(),
+                    div(class = "eyebrow", style = "text-align:center;", "System network"),
+                    div(class = "eyebrow", style = "text-align:center;", "Stability landscape"),
+                    div(class = "eyebrow", style = "text-align:center;", "Time series"),
+
+                    div(class = "eyebrow", "Low"),
+                    div(class = "panel-card", plotOutput("ising_net_low", height = "230px")),
+                    div(class = "panel-card", plotOutput("ising_land_low", height = "230px")),
+                    div(class = "panel-card", plotOutput("ising_ts_low", height = "230px")),
+
+                    div(class = "eyebrow", "Moderate"),
+                    div(class = "panel-card", plotOutput("ising_net_mod", height = "230px")),
+                    div(class = "panel-card", plotOutput("ising_land_mod", height = "230px")),
+                    div(class = "panel-card", plotOutput("ising_ts_mod", height = "230px")),
+
+                    div(class = "eyebrow", "High"),
+                    div(class = "panel-card", plotOutput("ising_net_high", height = "230px")),
+                    div(class = "panel-card", plotOutput("ising_land_high", height = "230px")),
+                    div(class = "panel-card", plotOutput("ising_ts_high", height = "230px"))
+                  )
+              )
+            ),
+
+            tabPanel(
+              "Code 2.0",
+              div(style = "margin-top:22px;",
+                  div(class = "panel-card",
+                      h3("Ising landscape simulation code"),
+                      p(class = "small-muted", "The full R script used to build the network, landscape, and time-series panels above — copy and run directly (requires Isinglandr, qgraph, ggplot2)."),
+                      verbatimTextOutput("ising_code")
                   )
               )
             )
           )
         ),
-        
+
         # 6. Contribution
         tabItem(
           tabName = "contribution",
@@ -1048,15 +1586,88 @@ ui <- fluidPage(
             id = "contribution_tabs",
             type = "pills",
             tabPanel(
-              "Psychopathology theory",
-              div(class = "panel-card", style = "margin-top:22px;",
-                  p(class = "placeholder-note", "Content to be added.")
+              "Forecast model",
+              div(style = "margin-top:22px;",
+                  p(class = "lead", style = "margin-bottom:22px;",
+                    "How can we construct dynamical model of an individual's symptom network that allows us to simulate perturbations and forecast transitions between states?"
+                  ),
+                  div(style = "display:grid; grid-template-columns: 1fr 40px 1fr 40px 1fr 40px 1fr; gap:8px; align-items:stretch; margin-bottom:24px;",
+                      div(class = "panel-card card-pastel-1", style = "display:flex; align-items:center; justify-content:center; text-align:center;",
+                          h3(style = "margin:0;", "Describe the network")
+                      ),
+                      div(style = "display:flex; align-items:center; justify-content:center;",
+                          icon("arrow-right", style = "font-size:20px; color:#10212b;")
+                      ),
+                      div(class = "panel-card card-pastel-2", style = "display:flex; align-items:center; justify-content:center; text-align:center;",
+                          h3(style = "margin:0;", "Modelling dynamics")
+                      ),
+                      div(style = "display:flex; align-items:center; justify-content:center;",
+                          icon("arrow-right", style = "font-size:20px; color:#10212b;")
+                      ),
+                      div(class = "panel-card card-pastel-3", style = "display:flex; align-items:center; justify-content:center; text-align:center;",
+                          h3(style = "margin:0;", "Simulating trajectories")
+                      ),
+                      div(style = "display:flex; align-items:center; justify-content:center;",
+                          icon("arrow-right", style = "font-size:20px; color:#10212b;")
+                      ),
+                      div(class = "panel-card card-pastel-4", style = "display:flex; align-items:center; justify-content:center; text-align:center;",
+                          h3(style = "margin:0;", "Forecasting model")
+                      )
+                  ),
+                  withMathJax(
+                    div(class = "panel-card", style = "margin-bottom:18px;",
+                        h3("Parameters"),
+                        p("$$X_{t+1} = A X_t + B E_t + \\epsilon_t$$"),
+                        p(class = "card-text", "where:"),
+                        tags$ul(class = "card-text", style = "padding-left:18px; margin:0;",
+                            tags$li("\\(X_t\\) = symptom state at time t"),
+                            tags$li("\\(A\\) = network of symptom-to-symptom effects"),
+                            tags$li("\\(E_t\\) = external events/stressors"),
+                            tags$li("\\(B\\) = effects of those external events"),
+                            tags$li("\\(\\epsilon_t\\) = unexplained/random variation")
+                        )
+                    )
+                  ),
+                  div(class = "panel-card", style = "margin-bottom:18px;",
+                      h3("From prediction models to forecast models"),
+                      p(style = "margin-bottom:4px;", tags$strong("Prediction:")),
+                      p(class = "card-text", style = "font-style:italic; margin-bottom:14px;", "“The person will enter a depressive state.”"),
+                      p(style = "margin-bottom:4px;", tags$strong("Forecasting:")),
+                      p(class = "card-text", style = "font-style:italic; margin-bottom:0;", "“Given the person’s current state, estimated dynamics and uncertainty, these are the plausible trajectories and their associated probabilities.”")
+                  ),
+                  div(class = "panel-card",
+                      h3("Individualized Dynamical Forecast Model"),
+                      p(class = "card-text", "Long-term vision: an individualized dynamical Forecast Model of mental-health trajectories, analogous in principle to ensemble forecasting in meteorology.")
+                  )
               )
             ),
             tabPanel(
               "Clinical application",
-              div(class = "panel-card", style = "margin-top:22px;",
-                  p(class = "placeholder-note", "Content to be added.")
+              div(style = "margin-top:22px; display:grid; grid-template-columns:1fr 1fr; gap:18px;",
+                  div(class = "panel-card card-pastel-1",
+                      icon("stethoscope", class = "feature-card-icon"),
+                      h3(style = "font-weight:400;", "Personalised assessment and diagnostic profiling")
+                  ),
+                  div(class = "panel-card card-pastel-2",
+                      icon("layer-group", class = "feature-card-icon"),
+                      h3(style = "font-weight:400;", "Risk stratification")
+                  ),
+                  div(class = "panel-card card-pastel-3",
+                      icon("bullseye", class = "feature-card-icon"),
+                      h3(style = "font-weight:400;", "Personalised treatment with element-focused interventions")
+                  ),
+                  div(class = "panel-card card-pastel-4",
+                      icon("triangle-exclamation", class = "feature-card-icon"),
+                      h3(style = "font-weight:400;", "Preventive and timed interventions (warning systems)")
+                  ),
+                  div(class = "panel-card card-pastel-5",
+                      icon("chart-line", class = "feature-card-icon"),
+                      h3(style = "font-weight:400;", "Integrating EMA insights into ROM")
+                  ),
+                  div(class = "panel-card card-pastel-6",
+                      icon("shield", class = "feature-card-icon"),
+                      h3(style = "font-weight:400;", "Relapse prevention and profiling")
+                  )
               )
             )
           )
@@ -1067,7 +1678,26 @@ ui <- fluidPage(
           tabName = "references",
           div(class = "eyebrow", "References"),
           h2("References"),
-          p(class = "placeholder-note", "Content to be added.")
+          div(class = "panel-card",
+              p(class = "reference-item", HTML(
+                "Borsboom, D. (2017). A network theory of mental disorders. <em>World Psychiatry, 16</em>(1), 5–13. <a href=\"https://doi.org/10.1002/wps.20375\" target=\"_blank\">https://doi.org/10.1002/wps.20375</a>"
+              )),
+              p(class = "reference-item", HTML(
+                "Borsboom, D., Deserno, M. K., Rhemtulla, M., Epskamp, S., Fried, E. I., McNally, R. J., Robinaugh, D. J., Perugini, M., Dalege, J., Costantini, G., Isvoranu, A.-M., Wysocki, A. C., van Borkulo, C. D., & van Bork, R. (2021). Network analysis of multivariate data in psychological science. <em>Nature Reviews Methods Primers, 1</em>, Article 58. <a href=\"https://doi.org/10.1038/s43586-021-00055-w\" target=\"_blank\">https://doi.org/10.1038/s43586-021-00055-w</a>"
+              )),
+              p(class = "reference-item", HTML(
+                "Fried, E. I., & Cramer, A. O. J. (2017). Moving forward: Challenges and directions for psychopathological network theory and methodology. <em>Perspectives on Psychological Science, 12</em>(6), 999–1020. <a href=\"https://doi.org/10.1177/1745691617705892\" target=\"_blank\">https://doi.org/10.1177/1745691617705892</a>"
+              )),
+              p(class = "reference-item", HTML(
+                "Fried, E. I. (2022). Studying mental health problems as systems, not syndromes. <em>Current Directions in Psychological Science, 31</em>(6), 500–508. <a href=\"https://doi.org/10.1177/09637214221114089\" target=\"_blank\">https://doi.org/10.1177/09637214221114089</a>"
+              )),
+              p(class = "reference-item", HTML(
+                "Henry, T. R., Robinaugh, D. J., & Fried, E. I. (2022). On the control of psychological networks. <em>Psychometrika, 87</em>(1), 188–213. <a href=\"https://doi.org/10.1007/s11336-021-09796-9\" target=\"_blank\">https://doi.org/10.1007/s11336-021-09796-9</a>"
+              )),
+              p(class = "reference-item", style = "margin-bottom:0;", HTML(
+                "Robinaugh, D. J., Blanken, T. F., Bridger, E. K., Casamento-Moran, A., de Ron, J., Henry, T. R., Hoekstra, R. H. A., Stratis, G., van de Leemput, I. A., van Nes, E. H., Wang, S. B., Wheatley, T., & Fried, E. I. (2026). The future of the biopsychosocial model: Toward a transdisciplinary systems science of mental health. <em>Clinical Psychological Science, 14</em>(4), 470–496. <a href=\"https://doi.org/10.1177/21677026261435464\" target=\"_blank\">https://doi.org/10.1177/21677026261435464</a>"
+              ))
+          )
         )
       )
   )
@@ -1078,6 +1708,17 @@ ui <- fluidPage(
 # -----------------------------
 
 server <- function(input, output, session) {
+
+  # ---- About > Master's Thesis tab: code pop-up ----
+
+  observeEvent(input$thesis_code_btn, {
+    showModal(modalDialog(
+      title = "Analysis code",
+      pre(class = "code-block", "# R analysis code\n# Add your mixed graphical model / regression code here."),
+      easyClose = TRUE,
+      size = "l"
+    ))
+  })
 
   # ---- Complex systems tab: bio-psycho-social feature network ----
 
@@ -1225,85 +1866,36 @@ server <- function(input, output, session) {
     )
   })
 
-  network_params <- eventReactive(input$run_network, {
-    list(
-      target = input$network_target,
-      perturbation = input$network_perturbation,
-      coupling = input$network_coupling,
-      recovery = input$network_recovery
-    )
-  }, ignoreInit = FALSE)
-  
-  output$network_plot <- renderPlot({
-    p <- network_params()
-    
-    coords <- data.frame(
-      node = node_names,
-      x = c(0.10, 0.35, 0.68, 0.88, 0.44),
-      y = c(0.52, 0.78, 0.78, 0.45, 0.18)
-    )
-    
-    par(mar = c(0, 0, 0, 0), bg = "#ffffff")
-    plot(
-      coords$x, coords$y,
-      type = "n", xlim = c(0, 1), ylim = c(0, 1),
-      axes = FALSE, xlab = "", ylab = ""
-    )
-    
-    A <- base_A
-    for (r in seq_along(node_names)) {
-      for (c in seq_along(node_names)) {
-        if (r != c && abs(A[r, c]) > 0.03) {
-          from <- coords[coords$node == node_names[c], ]
-          to   <- coords[coords$node == node_names[r], ]
-          width <- 1 + 5 * min(abs(A[r, c]), 0.35) / 0.35
-          col <- ifelse(A[r, c] > 0, "#16c6d9", "#8a9aa1")
-          arrows(
-            from$x, from$y, to$x, to$y,
-            length = 0.08, angle = 22, lwd = width, col = col, code = 2
-          )
-        }
-      }
-    }
-    
-    target <- p$target
-    target_row <- coords[coords$node == target, ]
-    
-    points(coords$x, coords$y, pch = 21, bg = "#ffffff", col = "#10212b", lwd = 2, cex = 3.6)
-    points(target_row$x, target_row$y, pch = 21, bg = "#16c6d9", col = "#087f8d", lwd = 2, cex = 3.9)
-    
-    text(coords$x, coords$y - 0.075, labels = coords$node, col = "#10212b", cex = 1.05, font = 2)
-    
-    title(main = "Illustrative temporal symptom network", col.main = "#10212b", cex.main = 1.35, line = -1)
-    
-    text(target_row$x, target_row$y + 0.08,
-         labels = paste0("PERTURB: ", toupper(target)),
-         col = "#087f8d", cex = 0.80, font = 2)
-    
-    legend(
-      "bottomleft",
-      legend = c("Positive temporal effect", "Negative temporal effect", "Perturbed node"),
-      lty = c(1, 1, NA), pch = c(NA, NA, 21),
-      col = c("#16c6d9", "#8a9aa1", "#087f8d"),
-      pt.bg = c(NA, NA, "#16c6d9"), pt.cex = 1.5,
-      bty = "n", cex = 0.78, horiz = FALSE
-    )
+  output$hsmm_schematic <- renderPlot({
+    hsmm_schematic_plot(hsmm_sim_data$run_df)
   })
-  
-  output$network_state <- renderPrint({
-    p <- network_params()
-    s <- system_stability(p$coupling, p$recovery)
-    
-    cat("SYSTEM STATE\n")
-    cat(s$state, "\n\n")
-    cat("Target:", p$target, "\n")
-    cat("Perturbation:", round(p$perturbation, 2), "\n")
-    cat("Coupling:", round(p$coupling, 2), "\n")
-    cat("Recovery:", round(p$recovery, 2), "\n")
+
+  output$hsmm_segmented <- renderPlot({
+    hsmm_segmented_plot(hsmm_sim_data$df, hsmm_sim_data$run_df)
   })
-  
-  output$network_code <- renderPrint({
-    cat(paste(deparse(simulate_network), collapse = "\n"))
+
+  output$hsmm_code <- renderPrint({
+    cat(paste(deparse(hsmm_build_simulation), collapse = "\n"))
+    cat("\n\n")
+    cat(paste(deparse(hsmm_schematic_plot), collapse = "\n"))
+    cat("\n\n")
+    cat(paste(deparse(hsmm_segmented_plot), collapse = "\n"))
+  })
+
+  output$ising_net_low   <- renderPlot({ ising_env$ising_network_plot(ising_env$w_low,  "Low connectivity") })
+  output$ising_net_mod   <- renderPlot({ ising_env$ising_network_plot(ising_env$w_mod,  "Moderate connectivity") })
+  output$ising_net_high  <- renderPlot({ ising_env$ising_network_plot(ising_env$w_high, "High connectivity") })
+
+  output$ising_land_low  <- renderPlot({ plot(ising_env$result_low) })
+  output$ising_land_mod  <- renderPlot({ plot(ising_env$result_mod) })
+  output$ising_land_high <- renderPlot({ plot(ising_env$result_high) })
+
+  output$ising_ts_low  <- renderPlot({ ising_env$ising_timeseries_plot(ising_env$sim_low,  "Low") })
+  output$ising_ts_mod  <- renderPlot({ ising_env$ising_timeseries_plot(ising_env$sim_mod,  "Moderate") })
+  output$ising_ts_high <- renderPlot({ ising_env$ising_timeseries_plot(ising_env$sim_high, "High") })
+
+  output$ising_code <- renderPrint({
+    cat(ising_script)
   })
 }
 
